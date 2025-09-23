@@ -11,7 +11,7 @@
  *  - Timeout handling
  *  - Placeholder / parked page detection
  *  - Cloudflare / WAF / 5xx error detection
- *  - Blank or JS-only page detection
+ *  - Blank or JS-only page detection (including JS redirect scripts)
  *  - Clear summary with status icons
  */
 
@@ -24,9 +24,10 @@ import { URL } from "url";
 
 /* ------------------------ CONFIG ------------------------ */
 
-const MAX_REDIRECTS = 5;
-const REQUEST_TIMEOUT_MS = 10000;
+const MAX_REDIRECTS = 5; // Max redirect hops before assuming loop
+const REQUEST_TIMEOUT_MS = 10000; // HTTP request timeout
 
+// Patterns to detect placeholder / parked domains
 const PLACEHOLDER_PATTERNS = [
   "Welcome to nginx!",
   "This domain is parked",
@@ -35,12 +36,14 @@ const PLACEHOLDER_PATTERNS = [
   "Default PLESK Page",
 ];
 
+// Patterns to detect Cloudflare WAF / browser checks
 const WAF_PATTERNS = [
   "Attention Required! | Cloudflare",
   "Checking your browser before accessing",
   "DDOS protection by",
 ];
 
+// Patterns to detect Cloudflare / server 5xx error pages
 const ERROR_PAGE_PATTERNS = [
   "Error 521",
   "Error 522",
@@ -50,10 +53,12 @@ const ERROR_PAGE_PATTERNS = [
   "Service Temporarily Unavailable",
 ];
 
+// Status icons for console output
 const STATUS_ICONS = {
   VALID: "✅",
   PLACEHOLDER: "⚠️",
   EMPTY_PAGE: "📄",
+  JS_ONLY: "📜",
   CLIENT_ERROR: "🚫",
   SERVER_ERROR: "🔥",
   INVALID_SSL: "🔒",
@@ -98,20 +103,23 @@ async function fetchUrl(url, timeoutMs = REQUEST_TIMEOUT_MS) {
     const req = client.get(urlObj, (res) => {
       clearTimeout(timer);
       let body = "";
+
+      // Collect only first 8KB for detection
       res.on("data", (chunk) => {
         if (body.length < 8192) body += chunk.toString();
       });
-      res.on("end", () => resolve({ statusCode: res.statusCode, headers: res.headers, body })));
+
+      res.on("end", () =>
+        resolve({ statusCode: res.statusCode, headers: res.headers, body })
+      );
     });
 
     req.on("error", (err) => {
       clearTimeout(timer);
-      if (
-        err.code === "ECONNREFUSED" ||
-        err.code === "ENOTFOUND" ||
-        err.code === "EHOSTUNREACH"
-      ) resolve({ status: "REFUSED" });
-      else if (err.code === "CERT_HAS_EXPIRED" || err.code === "DEPTH_ZERO_SELF_SIGNED_CERT")
+
+      if (["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH"].includes(err.code))
+        resolve({ status: "REFUSED" });
+      else if (["CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT"].includes(err.code))
         resolve({ status: "INVALID_SSL" });
       else resolve({ status: "UNREACHABLE" });
     });
@@ -119,18 +127,25 @@ async function fetchUrl(url, timeoutMs = REQUEST_TIMEOUT_MS) {
 }
 
 /**
- * Determine if a page is blank or only contains JavaScript
+ * Determine if a page is blank or contains only JavaScript
  */
 function isEmptyOrJsOnly(body) {
   if (!body) return true;
 
-  const stripped = body
+  // Remove <head> and <noscript> content + all whitespace
+  let stripped = body
     .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, "")
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
     .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "")
     .replace(/\s/g, "");
 
-  return stripped.length === 0;
+  // Extract all <script> content
+  const scriptMatches = [...body.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)];
+  const scriptContent = scriptMatches.map((m) => m[1]).join("").trim();
+
+  // JS-only redirect / blank page
+  if (stripped === "" && scriptContent) return "JS_ONLY";
+
+  return stripped.length === 0 ? "EMPTY_PAGE" : false;
 }
 
 /* ------------------------ DOMAIN CHECK ------------------------ */
@@ -153,9 +168,9 @@ async function checkDomainStatus(domain) {
 
         const { status, statusCode, headers, body } = await fetchUrl(url);
 
-        if (status) return status; // Low-level errors (timeout, SSL, refused)
+        if (status) return status; // Timeout, SSL, refused, unreachable
 
-        // Handle redirects
+        // Handle HTTP redirects
         if (statusCode >= 300 && statusCode < 400 && headers.location) {
           url = new URL(headers.location, url).toString();
           redirects++;
@@ -166,21 +181,22 @@ async function checkDomainStatus(domain) {
         if (statusCode >= 500) return "SERVER_ERROR";
         if (statusCode >= 400) return "CLIENT_ERROR";
 
-        // Detect Cloudflare 5xx / WAF
         if (body) {
-          if (
-            body.includes('id="cf-wrapper"') &&
-            body.includes('id="cf-error-details"') &&
-            ERROR_PAGE_PATTERNS.some((p) => body.includes(p))
-          )
-            return "SERVER_ERROR";
+          // Detect empty or JS-only page
+          const emptyCheck = isEmptyOrJsOnly(body);
+          if (emptyCheck) return emptyCheck;
+
+          // Detect Cloudflare / WAF
+          if (body.includes('id="cf-wrapper"') && body.includes('id="cf-error-details"')) {
+            if (ERROR_PAGE_PATTERNS.some((p) => body.includes(p))) return "SERVER_ERROR";
+            return "PROTECTED";
+          }
 
           if (body.includes("Cloudflare Ray ID") || WAF_PATTERNS.some((p) => body.includes(p)))
             return "PROTECTED";
 
+          // Detect placeholder page
           if (PLACEHOLDER_PATTERNS.some((p) => body.includes(p))) return "PLACEHOLDER";
-
-          if (isEmptyOrJsOnly(body)) return "EMPTY_PAGE";
         }
 
         return "VALID";
@@ -224,6 +240,7 @@ async function main() {
     if (!uniqueDomains.length) return console.log("No domains found.");
 
     const results = [];
+
     for (const domain of uniqueDomains) {
       process.stdout.write(`Checking ${domain}... `);
       const result = await checkDomain(domain);
@@ -232,7 +249,7 @@ async function main() {
       console.log(`${icon} ${result.status}`);
     }
 
-    // Summary
+    // SUMMARY
     console.log("\n" + "=".repeat(50));
     console.log("SUMMARY:");
 
