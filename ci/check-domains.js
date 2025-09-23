@@ -1,19 +1,18 @@
 #!/usr/bin/env node
 
 /**
- * CI Domain Checker (refactored with debug)
+ * CI Domain Checker (Synchronous-style logging)
  *
  * Features:
- *  - DNS resolution (IPv4/IPv6)
+ *  - DNS resolution
  *  - HTTP/HTTPS accessibility
  *  - SSL/TLS validation
  *  - Redirect loop detection
  *  - Timeout handling
  *  - Placeholder / parked page detection
  *  - Cloudflare / WAF / 5xx error detection
- *  - Blank or JS-only page detection (including redirect scripts)
- *  - Clear summary with status icons
- *  - Debug mode
+ *  - Blank or JS-only page detection
+ *  - Debug logging for GitHub Actions
  */
 
 import { extractDomainsFromJSDoc } from "../build/jsdoc.js";
@@ -24,9 +23,10 @@ import https from "https";
 import { URL } from "url";
 
 /* ------------------------ CONFIG ------------------------ */
+
 const MAX_REDIRECTS = 5;
 const REQUEST_TIMEOUT_MS = 10000;
-const DEBUG = true;
+const DEBUG = true; // toggle debug messages
 
 const PLACEHOLDER_PATTERNS = [
   "Welcome to nginx!",
@@ -68,45 +68,41 @@ const STATUS_ICONS = {
   UNKNOWN: "❓",
 };
 
-/* ------------------------ UTILITIES ------------------------ */
+/* ------------------------ DEBUG HELPER ------------------------ */
 
-/**
- * Debug logger
- */
-function logDebug(message) {
-  if (DEBUG) console.log(`[DEBUG] ${message}`);
+function debugLog(...args) {
+  if (DEBUG) console.log("[DEBUG]", ...args);
 }
 
-/**
- * Check if a domain is resolvable via DNS (IPv4/IPv6)
- */
+/* ------------------------ UTILITIES ------------------------ */
+
+/** Check if a domain is resolvable via DNS (IPv4/IPv6) */
 async function isDomainResolvable(domain) {
   try {
     await dns.resolve4(domain);
-    logDebug(`Domain ${domain} resolved via IPv4`);
+    debugLog(domain, "DNS resolved via A record");
     return true;
   } catch {
     try {
       await dns.resolve6(domain);
-      logDebug(`Domain ${domain} resolved via IPv6`);
+      debugLog(domain, "DNS resolved via AAAA record");
       return true;
     } catch {
-      logDebug(`Domain ${domain} is NOT resolvable`);
+      debugLog(domain, "DNS NOT resolved");
       return false;
     }
   }
 }
 
-/**
- * Fetch a URL with timeout and return status, headers, and body
- */
+/** Fetch a URL with timeout and return status, headers, and body */
 async function fetchUrl(url, timeoutMs = REQUEST_TIMEOUT_MS) {
+  debugLog("Fetching", url);
   return new Promise((resolve) => {
     const urlObj = new URL(url);
     const client = urlObj.protocol === "https:" ? https : http;
 
     const timer = setTimeout(() => {
-      logDebug(`Request to ${url} timed out`);
+      debugLog("Timeout fetching", url);
       resolve({ status: "TIMEOUT" });
     }, timeoutMs);
 
@@ -116,29 +112,24 @@ async function fetchUrl(url, timeoutMs = REQUEST_TIMEOUT_MS) {
       res.on("data", (chunk) => {
         if (body.length < 8192) body += chunk.toString();
       });
-      res.on("end", () => {
-        logDebug(`Fetched ${url}: ${res.statusCode}`);
-        resolve({ statusCode: res.statusCode, headers: res.headers, body });
-      });
+      res.on("end", () =>
+        resolve({ statusCode: res.statusCode, headers: res.headers, body })
+      );
     });
 
     req.on("error", (err) => {
       clearTimeout(timer);
-      logDebug(`Error fetching ${url}: ${err.code}`);
-      if (["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH"].includes(err.code)) {
+      debugLog("Request error for", url, err.code);
+      if (["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH"].includes(err.code))
         resolve({ status: "REFUSED" });
-      } else if (["CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT"].includes(err.code)) {
+      else if (["CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT"].includes(err.code))
         resolve({ status: "INVALID_SSL" });
-      } else {
-        resolve({ status: "UNREACHABLE" });
-      }
+      else resolve({ status: "UNREACHABLE" });
     });
   });
 }
 
-/**
- * Determine if a page is blank or only contains JS
- */
+/** Determine if a page is blank or only contains JavaScript */
 function isEmptyOrJsOnly(body) {
   if (!body) return "EMPTY_PAGE";
 
@@ -151,16 +142,12 @@ function isEmptyOrJsOnly(body) {
   const scriptContent = scriptMatches.map((m) => m[1]).join("").trim();
 
   if (stripped === "" && scriptContent) return "JS_ONLY";
-  if (stripped.length === 0) return "EMPTY_PAGE";
-
-  return false;
+  return stripped.length === 0 ? "EMPTY_PAGE" : false;
 }
 
 /* ------------------------ DOMAIN CHECK ------------------------ */
 
-/**
- * Check if a domain is accessible and determine status
- */
+/** Check if a domain is accessible and determine status */
 async function checkDomainStatus(domain) {
   const protocols = ["https", "http"];
 
@@ -176,35 +163,54 @@ async function checkDomainStatus(domain) {
 
         const { status, statusCode, headers, body } = await fetchUrl(url);
 
-        if (status) return status; // Low-level errors
+        if (status) {
+          debugLog(domain, "Low-level status:", status);
+          return status;
+        }
 
         // Handle redirects
         if (statusCode >= 300 && statusCode < 400 && headers.location) {
           url = new URL(headers.location, url).toString();
-          logDebug(`Redirected to ${url}`);
           redirects++;
+          debugLog(domain, "Redirect to", url);
           continue;
         }
 
         // HTTP errors
-        if (statusCode >= 500) return "SERVER_ERROR";
-        if (statusCode >= 400) return "CLIENT_ERROR";
+        if (statusCode >= 500) {
+          debugLog(domain, "Server error", statusCode);
+          return `SERVER_ERROR_${statusCode}`;
+        }
+        if (statusCode >= 400) {
+          debugLog(domain, "Client error", statusCode);
+          return `CLIENT_ERROR_${statusCode}`;
+        }
 
         if (body) {
-          const emptyCheck = isEmptyOrJsOnly(body);
-          if (emptyCheck) return emptyCheck;
+          // Detect Cloudflare 5xx / WAF
+          for (const code of ["521","522","523","524","525"]) {
+            if (body.includes(`Error ${code}`)) {
+              debugLog(domain, "Cloudflare error detected:", code);
+              return `CLOUDFLARE_${code}`;
+            }
+          }
 
-          // Cloudflare / WAF / 5xx
-          if (body.includes('id="cf-wrapper"') && body.includes('id="cf-error-details"')) {
-            if (ERROR_PAGE_PATTERNS.some((p) => body.includes(p))) return "SERVER_ERROR";
+          if (body.includes("Cloudflare Ray ID") || WAF_PATTERNS.some((p) => body.includes(p))) {
+            debugLog(domain, "Protected by WAF");
             return "PROTECTED";
           }
 
-          if (body.includes("Cloudflare Ray ID") || WAF_PATTERNS.some((p) => body.includes(p)))
-            return "PROTECTED";
+          // Detect placeholder / blank / JS-only
+          const emptyCheck = isEmptyOrJsOnly(body);
+          if (emptyCheck) {
+            debugLog(domain, "Empty/JS-only page detected:", emptyCheck);
+            return emptyCheck;
+          }
 
-          // Placeholder
-          if (PLACEHOLDER_PATTERNS.some((p) => body.includes(p))) return "PLACEHOLDER";
+          if (PLACEHOLDER_PATTERNS.some((p) => body.includes(p))) {
+            debugLog(domain, "Placeholder page detected");
+            return "PLACEHOLDER";
+          }
         }
 
         return "VALID";
@@ -212,7 +218,7 @@ async function checkDomainStatus(domain) {
 
       return "REDIRECT_LOOP";
     } catch (err) {
-      logDebug(`Exception checking ${protocol}://${domain}: ${err.message}`);
+      debugLog(domain, "Error in checkDomainStatus", err.message);
       continue;
     }
   }
@@ -220,20 +226,18 @@ async function checkDomainStatus(domain) {
   return "UNREACHABLE";
 }
 
-/**
- * Main domain check wrapper with DNS resolution
- */
+/** Main wrapper with DNS resolution */
 async function checkDomain(domain) {
   const resolvable = await isDomainResolvable(domain);
-  if (!resolvable) {
+  if (!resolvable)
     return { domain, status: "EXPIRED", resolvable: false, accessible: false };
-  }
 
   const status = await checkDomainStatus(domain);
   return { domain, status, resolvable: true, accessible: status === "VALID" };
 }
 
 /* ------------------------ MAIN ------------------------ */
+
 async function main() {
   const args = process.argv.slice(2);
   const categories = args.length ? args : null;
@@ -241,52 +245,44 @@ async function main() {
   console.log("Extracting domains from sites directory...");
   console.log(`Categories: ${categories ? categories.join(", ") : "all"}`);
 
-  try {
-    const domains = await extractDomainsFromJSDoc(categories);
-    const uniqueDomains = deduplicateRootDomains(domains);
+  const domains = await extractDomainsFromJSDoc(categories);
+  const uniqueDomains = deduplicateRootDomains(domains);
 
-    console.log(`Found ${uniqueDomains.length} unique root domains\n`);
-    if (!uniqueDomains.length) return console.log("No domains found.");
+  console.log(`Found ${uniqueDomains.length} unique domains\n`);
+  if (!uniqueDomains.length) return console.log("No domains found.");
 
-    const results = [];
-    for (const domain of uniqueDomains) {
-      logDebug(`Checking domain: ${domain}`);
-      const result = await checkDomain(domain);
-      results.push(result);
-      const icon = STATUS_ICONS[result.status] || "❓";
-      console.log(`Checking ${domain}... ${icon} ${result.status}`);
-    }
-
-    // Summary
-    console.log("\n" + "=".repeat(50));
-    console.log("SUMMARY:");
-
-    const counts = results.reduce((acc, r) => {
-      acc[r.status] = (acc[r.status] || 0) + 1;
-      return acc;
-    }, {});
-
-    Object.keys(STATUS_ICONS).forEach((status) => {
-      if (counts[status]) console.log(`${STATUS_ICONS[status]} ${status}: ${counts[status]}`);
-    });
-
-    console.log(`📊 Total: ${results.length}`);
-
-    // Show problematic domains
-    const problematic = results.filter((r) => r.status !== "VALID");
-    problematic.forEach((r) => {
-      console.log(`${STATUS_ICONS[r.status] || "❓"} ${r.status} -> ${r.domain}`);
-    });
-
-    console.log(
-      problematic.length
-        ? `\n⚠️ Found ${problematic.length} problematic domain(s)`
-        : "\n✅ All domains are valid!"
-    );
-  } catch (err) {
-    console.error(`Error: ${err.message}`);
-    process.exit(1);
+  const results = [];
+  for (const domain of uniqueDomains) {
+    process.stdout.write(`Checking ${domain}... `);
+    const result = await checkDomain(domain);
+    results.push(result);
+    const icon = STATUS_ICONS[result.status] || "❓";
+    console.log(`${icon} ${result.status}`);
   }
+
+  // Summary
+  console.log("\n" + "=".repeat(50));
+  console.log("SUMMARY:");
+  const counts = results.reduce((acc, r) => {
+    acc[r.status] = (acc[r.status] || 0) + 1;
+    return acc;
+  }, {});
+  Object.keys(STATUS_ICONS).forEach((status) => {
+    if (counts[status]) console.log(`${STATUS_ICONS[status]} ${status}: ${counts[status]}`);
+  });
+
+  console.log(`📊 Total: ${results.length}`);
+
+  const problematic = results.filter((r) => r.status !== "VALID");
+  problematic.forEach((r) => {
+    console.log(`${STATUS_ICONS[r.status] || "❓"} ${r.status} -> ${r.domain}`);
+  });
+
+  console.log(
+    problematic.length
+      ? `\n⚠️ Found ${problematic.length} problematic domain(s)`
+      : "\n✅ All domains are valid!"
+  );
 }
 
 main().catch(console.error);
