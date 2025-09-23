@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Simple domain checker - extracts domains from src/sites/**.js and reports validity
+ * Enhanced domain checker - extracts domains from src/sites/**.js and reports validity
  */
 import { extractDomainsFromJSDoc } from "../build/jsdoc.js";
 import { deduplicateRootDomains } from "../build/domain.js";
@@ -9,6 +9,31 @@ import dns from "dns/promises";
 import https from "https";
 import http from "http";
 import { URL } from "url";
+
+/**
+ * Common placeholder text patterns that indicate a parked/default site
+ */
+const BAD_PATTERNS = [
+  "Welcome to nginx!",
+  "This domain is parked",
+  "Buy this domain",
+  "Domain for sale",
+  "Default PLESK Page",
+];
+
+/**
+ * Status → Icon mapping
+ */
+const STATUS_ICONS = {
+  VALID: "✅",
+  PLACEHOLDER: "⚠️",
+  CLIENT_ERROR: "🚫",
+  SERVER_ERROR: "🔥",
+  INVALID_SSL: "🔒",
+  EXPIRED: "❌",
+  UNREACHABLE: "🌐",
+  UNKNOWN: "❓",
+};
 
 /**
  * Check if a domain is resolvable via DNS
@@ -20,12 +45,12 @@ async function isDomainResolvable(domain) {
     // Try IPv4 first
     await dns.resolve4(domain);
     return true;
-  } catch (ipv4Error) {
+  } catch {
     try {
       // Try IPv6 if IPv4 fails
       await dns.resolve6(domain);
       return true;
-    } catch (ipv6Error) {
+    } catch {
       return false;
     }
   }
@@ -34,7 +59,7 @@ async function isDomainResolvable(domain) {
 /**
  * Check if a domain is accessible via HTTP/HTTPS
  * @param {string} domain - Domain to check
- * @returns {Promise<boolean>} True if accessible
+ * @returns {Promise<string>} Status string
  */
 async function isDomainAccessible(domain) {
   const protocols = ["https", "http"];
@@ -46,35 +71,64 @@ async function isDomainAccessible(domain) {
       const isHttps = protocol === "https";
       const client = isHttps ? https : http;
 
-      const result = await new Promise((resolve, reject) => {
+      const result = await new Promise((resolve) => {
         const req = client.request(
           {
             hostname: urlObj.hostname,
             port: urlObj.port || (isHttps ? 443 : 80),
-            path: urlObj.pathname,
-            method: "HEAD",
+            path: urlObj.pathname || "/",
+            method: "GET",
             timeout: 5000,
             headers: {
-              "User-Agent": "Mozilla/5.0 (compatible; DomainChecker/1.0)",
+              "User-Agent": "Mozilla/5.0 (compatible; DomainChecker/1.1)",
             },
           },
           (res) => {
-            resolve(true);
+            let body = "";
+            res.on("data", (chunk) => {
+              if (body.length < 4096) body += chunk.toString();
+            });
+            res.on("end", () => {
+              const { statusCode } = res;
+
+              if (statusCode >= 200 && statusCode < 400) {
+                const isPlaceholder = BAD_PATTERNS.some((p) =>
+                  body.includes(p),
+                );
+                resolve(isPlaceholder ? "PLACEHOLDER" : "VALID");
+              } else if (statusCode >= 400 && statusCode < 500) {
+                resolve("CLIENT_ERROR");
+              } else if (statusCode >= 500) {
+                resolve("SERVER_ERROR");
+              } else {
+                resolve("UNKNOWN");
+              }
+            });
           },
         );
 
-        req.on("error", () => resolve(false));
-        req.on("timeout", () => resolve(false));
+        req.on("error", (err) => {
+          if (
+            isHttps &&
+            (err.code === "CERT_HAS_EXPIRED" ||
+              err.code === "DEPTH_ZERO_SELF_SIGNED_CERT")
+          ) {
+            resolve("INVALID_SSL");
+          } else {
+            resolve("UNREACHABLE");
+          }
+        });
+        req.on("timeout", () => resolve("UNREACHABLE"));
         req.end();
       });
 
-      if (result) return true;
-    } catch (error) {
+      if (result !== "UNREACHABLE") return result;
+    } catch {
       continue;
     }
   }
 
-  return false;
+  return "UNREACHABLE";
 }
 
 /**
@@ -89,18 +143,14 @@ async function checkDomain(domain) {
     return { domain, status: "EXPIRED", resolvable: false, accessible: false };
   }
 
-  const isAccessible = await isDomainAccessible(domain);
+  const status = await isDomainAccessible(domain);
 
-  if (isAccessible) {
-    return { domain, status: "VALID", resolvable: true, accessible: true };
-  } else {
-    return {
-      domain,
-      status: "UNREACHABLE",
-      resolvable: true,
-      accessible: false,
-    };
-  }
+  return {
+    domain,
+    status,
+    resolvable: true,
+    accessible: status === "VALID",
+  };
 }
 
 /**
@@ -136,12 +186,7 @@ async function main() {
       const result = await checkDomain(domain);
       results.push(result);
 
-      const statusIcon =
-        result.status === "VALID"
-          ? "✅"
-          : result.status === "EXPIRED"
-            ? "❌"
-            : "⚠️";
+      const statusIcon = STATUS_ICONS[result.status] || "❓";
       console.log(`${statusIcon} ${result.status}`);
     }
 
@@ -149,39 +194,46 @@ async function main() {
     console.log("\n" + "=".repeat(50));
     console.log("SUMMARY:");
 
-    const validCount = results.filter((r) => r.status === "VALID").length;
-    const expiredCount = results.filter((r) => r.status === "EXPIRED").length;
-    const unreachableCount = results.filter(
-      (r) => r.status === "UNREACHABLE",
-    ).length;
+    const counts = results.reduce((acc, r) => {
+      acc[r.status] = (acc[r.status] || 0) + 1;
+      return acc;
+    }, {});
 
-    console.log(`✅ Valid: ${validCount}`);
-    console.log(`❌ Expired: ${expiredCount}`);
-    console.log(`⚠️  Unreachable: ${unreachableCount}`);
+    const order = [
+      "VALID",
+      "PLACEHOLDER",
+      "CLIENT_ERROR",
+      "SERVER_ERROR",
+      "INVALID_SSL",
+      "EXPIRED",
+      "UNREACHABLE",
+      "UNKNOWN",
+    ];
+
+    for (const status of order) {
+      if (counts[status]) {
+        console.log(`${STATUS_ICONS[status]} ${status}: ${counts[status]}`);
+      }
+    }
+
     console.log(`📊 Total: ${results.length}`);
 
-    // Show expired domains
-    const expiredDomains = results
-      .filter((r) => r.status === "EXPIRED")
-      .map((r) => r.domain);
-    if (expiredDomains.length > 0) {
-      console.log("\n❌ EXPIRED DOMAINS:");
-      expiredDomains.forEach((domain) => console.log(`  - ${domain}`));
+    // Show problematic domains
+    const problemStatuses = order.filter((s) => s !== "VALID");
+    for (const status of problemStatuses) {
+      const badDomains = results
+        .filter((r) => r.status === status)
+        .map((r) => r.domain);
+
+      if (badDomains.length > 0) {
+        console.log(`\n${STATUS_ICONS[status]} ${status} DOMAINS:`);
+        badDomains.forEach((d) => console.log(`  - ${d}`));
+      }
     }
 
-    // Show unreachable domains
-    const unreachableDomains = results
-      .filter((r) => r.status === "UNREACHABLE")
-      .map((r) => r.domain);
-    if (unreachableDomains.length > 0) {
-      console.log("\n⚠️  UNREACHABLE DOMAINS:");
-      unreachableDomains.forEach((domain) => console.log(`  - ${domain}`));
-    }
-
-    // Report summary (no exit codes for reporting mode)
-    const invalidCount = expiredCount + unreachableCount;
+    const invalidCount = results.filter((r) => r.status !== "VALID").length;
     if (invalidCount > 0) {
-      console.log(`\n⚠️  Found ${invalidCount} invalid domain(s)`);
+      console.log(`\n⚠️ Found ${invalidCount} problematic domain(s)`);
     } else {
       console.log("\n✅ All domains are valid!");
     }
