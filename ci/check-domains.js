@@ -1,8 +1,23 @@
 #!/usr/bin/env node
 
 /**
- * Enhanced domain checker - extracts domains from src/sites/**.js and reports validity
+ * Next-Level Domain Checker for CI
+ *
+ * This script extracts domains from src/sites/**.js using JSDoc metadata,
+ * checks whether they are valid, accessible, or problematic, and prints
+ * a detailed summary with icons.
+ *
+ * Features:
+ * - DNS resolution check
+ * - HTTP/HTTPS access check
+ * - SSL/TLS validation
+ * - Redirect loop detection
+ * - Empty page / placeholder detection
+ * - Cloudflare/WAF interstitial detection
+ * - Differentiates TCP connection refused vs timeout
+ * - Provides per-domain and summary reporting
  */
+
 import { extractDomainsFromJSDoc } from "../build/jsdoc.js";
 import { deduplicateRootDomains } from "../build/domain.js";
 import dns from "dns/promises";
@@ -10,9 +25,7 @@ import https from "https";
 import http from "http";
 import { URL } from "url";
 
-/**
- * Common placeholder text patterns that indicate a parked/default site
- */
+/** Patterns indicating parked / placeholder pages */
 const BAD_PATTERNS = [
   "Welcome to nginx!",
   "This domain is parked",
@@ -21,33 +34,44 @@ const BAD_PATTERNS = [
   "Default PLESK Page",
 ];
 
-/**
- * Status → Icon mapping
- */
+/** Patterns indicating Cloudflare/WAF interstitial pages */
+const WAF_PATTERNS = [
+  "Attention Required! | Cloudflare",
+  "Checking your browser before accessing",
+  "DDOS protection by",
+];
+
+/** Status → Icon mapping */
 const STATUS_ICONS = {
   VALID: "✅",
   PLACEHOLDER: "⚠️",
+  EMPTY_PAGE: "📄",
   CLIENT_ERROR: "🚫",
   SERVER_ERROR: "🔥",
   INVALID_SSL: "🔒",
   EXPIRED: "❌",
   UNREACHABLE: "🌐",
+  REFUSED: "⛔",
+  TIMEOUT: "⏱️",
+  REDIRECT_LOOP: "🔁",
+  PROTECTED: "🛡️",
   UNKNOWN: "❓",
 };
 
+/** Maximum number of redirects to follow before considering a loop */
+const MAX_REDIRECTS = 5;
+
 /**
- * Check if a domain is resolvable via DNS
- * @param {string} domain - Domain to check
- * @returns {Promise<boolean>} True if resolvable
+ * Checks if a domain resolves via DNS (IPv4 or IPv6)
+ * @param {string} domain
+ * @returns {Promise<boolean>}
  */
 async function isDomainResolvable(domain) {
   try {
-    // Try IPv4 first
     await dns.resolve4(domain);
     return true;
   } catch {
     try {
-      // Try IPv6 if IPv4 fails
       await dns.resolve6(domain);
       return true;
     } catch {
@@ -57,74 +81,97 @@ async function isDomainResolvable(domain) {
 }
 
 /**
- * Check if a domain is accessible via HTTP/HTTPS
- * @param {string} domain - Domain to check
- * @returns {Promise<string>} Status string
+ * Checks if the domain is accessible via HTTP/HTTPS and returns status
+ * @param {string} domain
+ * @returns {Promise<string>} Status string (VALID, PLACEHOLDER, EMPTY_PAGE, SERVER_ERROR, etc.)
  */
 async function isDomainAccessible(domain) {
   const protocols = ["https", "http"];
 
   for (const protocol of protocols) {
     try {
-      const url = `${protocol}://${domain}`;
-      const urlObj = new URL(url);
-      const isHttps = protocol === "https";
-      const client = isHttps ? https : http;
+      let url = `${protocol}://${domain}`;
+      const visited = new Set();
+      let redirects = 0;
 
-      const result = await new Promise((resolve) => {
-        const req = client.request(
-          {
-            hostname: urlObj.hostname,
-            port: urlObj.port || (isHttps ? 443 : 80),
-            path: urlObj.pathname || "/",
-            method: "GET",
-            timeout: 5000,
-            headers: {
-              "User-Agent": "Mozilla/5.0 (compatible; DomainChecker/1.1)",
+      while (redirects < MAX_REDIRECTS) {
+        if (visited.has(url)) return "REDIRECT_LOOP";
+        visited.add(url);
+
+        const urlObj = new URL(url);
+        const isHttps = protocol === "https";
+        const client = isHttps ? https : http;
+
+        const result = await new Promise((resolve) => {
+          const req = client.request(
+            {
+              hostname: urlObj.hostname,
+              port: urlObj.port || (isHttps ? 443 : 80),
+              path: urlObj.pathname || "/",
+              method: "GET",
+              timeout: 7000,
+              headers: {
+                "User-Agent": "Mozilla/5.0 (compatible; DomainChecker/3.0)",
+              },
             },
-          },
-          (res) => {
-            let body = "";
-            res.on("data", (chunk) => {
-              if (body.length < 4096) body += chunk.toString();
-            });
-            res.on("end", () => {
-              const { statusCode } = res;
+            (res) => {
+              let body = "";
+              res.on("data", (chunk) => {
+                if (body.length < 8192) body += chunk.toString();
+              });
+              res.on("end", () => {
+                const { statusCode, headers } = res;
 
-              if (statusCode >= 200 && statusCode < 400) {
-                const isPlaceholder = BAD_PATTERNS.some((p) =>
-                  body.includes(p),
-                );
-                resolve(isPlaceholder ? "PLACEHOLDER" : "VALID");
-              } else if (statusCode >= 400 && statusCode < 500) {
-                resolve("CLIENT_ERROR");
-              } else if (statusCode >= 500) {
-                resolve("SERVER_ERROR");
-              } else {
-                resolve("UNKNOWN");
-              }
-            });
-          },
-        );
+                // Handle redirects
+                if (statusCode >= 300 && statusCode < 400 && headers.location) {
+                  url = new URL(headers.location, url).toString();
+                  redirects++;
+                  return resolve("REDIRECT");
+                }
 
-        req.on("error", (err) => {
-          if (
-            isHttps &&
-            (err.code === "CERT_HAS_EXPIRED" ||
-              err.code === "DEPTH_ZERO_SELF_SIGNED_CERT")
-          ) {
-            resolve("INVALID_SSL");
-          } else {
-            resolve("UNREACHABLE");
-          }
+                // HTTP errors
+                if (statusCode >= 500) return resolve("SERVER_ERROR");
+                if (statusCode >= 400) return resolve("CLIENT_ERROR");
+
+                const strippedBody = body.replace(/\s/g, "");
+
+                // Detect empty or placeholder pages
+                if (strippedBody.length < 50) return resolve("EMPTY_PAGE");
+                if (BAD_PATTERNS.some((p) => body.includes(p))) return resolve("PLACEHOLDER");
+                if (WAF_PATTERNS.some((p) => body.includes(p))) return resolve("PROTECTED");
+
+                // Everything else is valid
+                return resolve("VALID");
+              });
+            }
+          );
+
+          req.on("error", (err) => {
+            if (
+              isHttps &&
+              (err.code === "CERT_HAS_EXPIRED" || err.code === "DEPTH_ZERO_SELF_SIGNED_CERT")
+            ) {
+              resolve("INVALID_SSL");
+            } else if (err.code === "ECONNREFUSED") {
+              resolve("REFUSED");
+            } else if (err.code === "ETIMEDOUT") {
+              resolve("TIMEOUT");
+            } else {
+              resolve("UNREACHABLE");
+            }
+          });
+
+          req.on("timeout", () => resolve("TIMEOUT"));
+          req.end();
         });
-        req.on("timeout", () => resolve("UNREACHABLE"));
-        req.end();
-      });
 
-      if (result !== "UNREACHABLE") return result;
+        if (result === "REDIRECT") continue; // Follow redirect
+        return result;
+      }
+
+      return "REDIRECT_LOOP"; // Exceeded max redirects
     } catch {
-      continue;
+      continue; // Try next protocol
     }
   }
 
@@ -132,68 +179,51 @@ async function isDomainAccessible(domain) {
 }
 
 /**
- * Check domain status
- * @param {string} domain - Domain to check
- * @returns {Promise<Object>} Status object
+ * Performs full check for a single domain (DNS + accessibility)
+ * @param {string} domain
+ * @returns {Promise<{domain:string,status:string,resolvable:boolean,accessible:boolean}>}
  */
 async function checkDomain(domain) {
-  const isResolvable = await isDomainResolvable(domain);
+  const resolvable = await isDomainResolvable(domain);
 
-  if (!isResolvable) {
+  if (!resolvable) {
     return { domain, status: "EXPIRED", resolvable: false, accessible: false };
   }
 
   const status = await isDomainAccessible(domain);
 
-  return {
-    domain,
-    status,
-    resolvable: true,
-    accessible: status === "VALID",
-  };
+  return { domain, status, resolvable: true, accessible: status === "VALID" };
 }
 
 /**
- * Main function
+ * Main function to extract domains, check each, and summarize results
  */
 async function main() {
   const args = process.argv.slice(2);
-  const categories = args.length > 0 ? args : null;
+  const categories = args.length ? args : null;
 
   console.log("Extracting domains from sites directory...");
-  if (categories) {
-    console.log(`Categories: ${categories.join(", ")}`);
-  } else {
-    console.log("Categories: all");
-  }
+  console.log(`Categories: ${categories ? categories.join(", ") : "all"}`);
 
   try {
-    // Extract domains from sites
     const domains = await extractDomainsFromJSDoc(categories);
     const uniqueDomains = deduplicateRootDomains(domains);
 
     console.log(`Found ${uniqueDomains.length} unique root domains\n`);
+    if (!uniqueDomains.length) return console.log("No domains found.");
 
-    if (uniqueDomains.length === 0) {
-      console.log("No domains found.");
-      return;
-    }
-
-    // Check each domain
     const results = [];
     for (const domain of uniqueDomains) {
       process.stdout.write(`Checking ${domain}... `);
       const result = await checkDomain(domain);
       results.push(result);
-
-      const statusIcon = STATUS_ICONS[result.status] || "❓";
-      console.log(`${statusIcon} ${result.status}`);
+      const icon = STATUS_ICONS[result.status] || "❓";
+      console.log(`${icon} ${result.status}`);
     }
 
     // Summary
     console.log("\n" + "=".repeat(50));
     console.log("SUMMARY:");
-
     const counts = results.reduce((acc, r) => {
       acc[r.status] = (acc[r.status] || 0) + 1;
       return acc;
@@ -202,10 +232,15 @@ async function main() {
     const order = [
       "VALID",
       "PLACEHOLDER",
+      "EMPTY_PAGE",
       "CLIENT_ERROR",
       "SERVER_ERROR",
+      "PROTECTED",
       "INVALID_SSL",
       "EXPIRED",
+      "REFUSED",
+      "TIMEOUT",
+      "REDIRECT_LOOP",
       "UNREACHABLE",
       "UNKNOWN",
     ];
@@ -218,30 +253,25 @@ async function main() {
 
     console.log(`📊 Total: ${results.length}`);
 
-    // Show problematic domains
+    // Print domains per problem status
     const problemStatuses = order.filter((s) => s !== "VALID");
     for (const status of problemStatuses) {
-      const badDomains = results
-        .filter((r) => r.status === status)
-        .map((r) => r.domain);
-
-      if (badDomains.length > 0) {
+      const badDomains = results.filter((r) => r.status === status).map((r) => r.domain);
+      if (badDomains.length) {
         console.log(`\n${STATUS_ICONS[status]} ${status} DOMAINS:`);
         badDomains.forEach((d) => console.log(`  - ${d}`));
       }
     }
 
     const invalidCount = results.filter((r) => r.status !== "VALID").length;
-    if (invalidCount > 0) {
-      console.log(`\n⚠️ Found ${invalidCount} problematic domain(s)`);
-    } else {
-      console.log("\n✅ All domains are valid!");
-    }
-  } catch (error) {
-    console.error(`Error: ${error.message}`);
+    console.log(
+      invalidCount ? `\n⚠️ Found ${invalidCount} problematic domain(s)` : "\n✅ All domains are valid!"
+    );
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
     process.exit(1);
   }
 }
 
-// Execute main function directly
+// Execute main function
 main().catch(console.error);
