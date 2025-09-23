@@ -1,21 +1,20 @@
 #!/usr/bin/env node
 
 /**
- * Next-Level Domain Checker for CI
+ * CI Domain Checker
  *
- * This script extracts domains from src/sites/**.js using JSDoc metadata,
- * checks whether they are valid, accessible, or problematic, and prints
- * a detailed summary with icons.
+ * Extracts domains from src/sites/**.js using JSDoc metadata
+ * and checks each domain for:
+ * - DNS resolution
+ * - HTTP/HTTPS accessibility
+ * - SSL/TLS issues
+ * - Redirect loops
+ * - Empty or minimal pages
+ * - Placeholder / parked pages
+ * - Cloudflare/WAF interstitial pages
+ * - Known error pages (e.g., Cloudflare 521)
  *
- * Features:
- * - DNS resolution check
- * - HTTP/HTTPS access check
- * - SSL/TLS validation
- * - Redirect loop detection
- * - Empty page / placeholder detection
- * - Cloudflare/WAF interstitial detection
- * - Differentiates TCP connection refused vs timeout
- * - Provides per-domain and summary reporting
+ * Prints detailed per-domain status and summary with icons.
  */
 
 import { extractDomainsFromJSDoc } from "../build/jsdoc.js";
@@ -25,8 +24,10 @@ import https from "https";
 import http from "http";
 import { URL } from "url";
 
-/** Patterns indicating parked / placeholder pages */
-const BAD_PATTERNS = [
+/* ------------------------ CONFIG ------------------------ */
+
+/** Patterns for placeholder/parked pages */
+const PLACEHOLDER_PATTERNS = [
   "Welcome to nginx!",
   "This domain is parked",
   "Buy this domain",
@@ -34,14 +35,25 @@ const BAD_PATTERNS = [
   "Default PLESK Page",
 ];
 
-/** Patterns indicating Cloudflare/WAF interstitial pages */
+/** Patterns for Cloudflare / WAF / interstitial pages */
 const WAF_PATTERNS = [
   "Attention Required! | Cloudflare",
   "Checking your browser before accessing",
   "DDOS protection by",
 ];
 
-/** Status → Icon mapping */
+/** Patterns for known error pages returned with 200 */
+const ERROR_PAGE_PATTERNS = [
+  "Error 521",
+  "Error 522",
+  "Error 523",
+  "Error 524",
+  "Error 525",
+  "Service Temporarily Unavailable",
+  "Cloudflare Ray ID",
+];
+
+/** Status icons for reporting */
 const STATUS_ICONS = {
   VALID: "✅",
   PLACEHOLDER: "⚠️",
@@ -58,11 +70,13 @@ const STATUS_ICONS = {
   UNKNOWN: "❓",
 };
 
-/** Maximum number of redirects to follow before considering a loop */
+/** Maximum redirects to follow before considering a loop */
 const MAX_REDIRECTS = 5;
 
+/* ------------------------ HELPERS ------------------------ */
+
 /**
- * Checks if a domain resolves via DNS (IPv4 or IPv6)
+ * Check if a domain resolves via DNS (IPv4 or IPv6)
  * @param {string} domain
  * @returns {Promise<boolean>}
  */
@@ -81,9 +95,9 @@ async function isDomainResolvable(domain) {
 }
 
 /**
- * Checks if the domain is accessible via HTTP/HTTPS and returns status
+ * Check domain accessibility via HTTP/HTTPS and classify status
  * @param {string} domain
- * @returns {Promise<string>} Status string (VALID, PLACEHOLDER, EMPTY_PAGE, SERVER_ERROR, etc.)
+ * @returns {Promise<string>} Status string
  */
 async function isDomainAccessible(domain) {
   const protocols = ["https", "http"];
@@ -111,7 +125,7 @@ async function isDomainAccessible(domain) {
               method: "GET",
               timeout: 7000,
               headers: {
-                "User-Agent": "Mozilla/5.0 (compatible; DomainChecker/3.0)",
+                "User-Agent": "Mozilla/5.0 (compatible; DomainChecker/3.2)",
               },
             },
             (res) => {
@@ -122,7 +136,7 @@ async function isDomainAccessible(domain) {
               res.on("end", () => {
                 const { statusCode, headers } = res;
 
-                // Handle redirects
+                // Follow redirects
                 if (statusCode >= 300 && statusCode < 400 && headers.location) {
                   url = new URL(headers.location, url).toString();
                   redirects++;
@@ -133,14 +147,14 @@ async function isDomainAccessible(domain) {
                 if (statusCode >= 500) return resolve("SERVER_ERROR");
                 if (statusCode >= 400) return resolve("CLIENT_ERROR");
 
+                // Inspect body for errors / placeholders / WAFs
                 const strippedBody = body.replace(/\s/g, "");
 
-                // Detect empty or placeholder pages
+                if (ERROR_PAGE_PATTERNS.some((p) => body.includes(p))) return resolve("SERVER_ERROR");
                 if (strippedBody.length < 50) return resolve("EMPTY_PAGE");
-                if (BAD_PATTERNS.some((p) => body.includes(p))) return resolve("PLACEHOLDER");
+                if (PLACEHOLDER_PATTERNS.some((p) => body.includes(p))) return resolve("PLACEHOLDER");
                 if (WAF_PATTERNS.some((p) => body.includes(p))) return resolve("PROTECTED");
 
-                // Everything else is valid
                 return resolve("VALID");
               });
             }
@@ -165,13 +179,13 @@ async function isDomainAccessible(domain) {
           req.end();
         });
 
-        if (result === "REDIRECT") continue; // Follow redirect
+        if (result === "REDIRECT") continue;
         return result;
       }
 
-      return "REDIRECT_LOOP"; // Exceeded max redirects
+      return "REDIRECT_LOOP";
     } catch {
-      continue; // Try next protocol
+      continue; // try next protocol
     }
   }
 
@@ -179,25 +193,20 @@ async function isDomainAccessible(domain) {
 }
 
 /**
- * Performs full check for a single domain (DNS + accessibility)
+ * Performs full domain check (DNS + HTTP)
  * @param {string} domain
  * @returns {Promise<{domain:string,status:string,resolvable:boolean,accessible:boolean}>}
  */
 async function checkDomain(domain) {
   const resolvable = await isDomainResolvable(domain);
-
-  if (!resolvable) {
-    return { domain, status: "EXPIRED", resolvable: false, accessible: false };
-  }
+  if (!resolvable) return { domain, status: "EXPIRED", resolvable: false, accessible: false };
 
   const status = await isDomainAccessible(domain);
-
   return { domain, status, resolvable: true, accessible: status === "VALID" };
 }
 
-/**
- * Main function to extract domains, check each, and summarize results
- */
+/* ------------------------ MAIN ------------------------ */
+
 async function main() {
   const args = process.argv.slice(2);
   const categories = args.length ? args : null;
@@ -224,6 +233,7 @@ async function main() {
     // Summary
     console.log("\n" + "=".repeat(50));
     console.log("SUMMARY:");
+
     const counts = results.reduce((acc, r) => {
       acc[r.status] = (acc[r.status] || 0) + 1;
       return acc;
@@ -246,14 +256,11 @@ async function main() {
     ];
 
     for (const status of order) {
-      if (counts[status]) {
-        console.log(`${STATUS_ICONS[status]} ${status}: ${counts[status]}`);
-      }
+      if (counts[status]) console.log(`${STATUS_ICONS[status]} ${status}: ${counts[status]}`);
     }
 
     console.log(`📊 Total: ${results.length}`);
 
-    // Print domains per problem status
     const problemStatuses = order.filter((s) => s !== "VALID");
     for (const status of problemStatuses) {
       const badDomains = results.filter((r) => r.status === status).map((r) => r.domain);
@@ -273,5 +280,5 @@ async function main() {
   }
 }
 
-// Execute main function
+// Run main
 main().catch(console.error);
