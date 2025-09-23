@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * CI Domain Checker (Refactored)
+ * CI Domain Checker
  *
  * Features:
  *  - DNS resolution
@@ -11,7 +11,7 @@
  *  - Timeout handling
  *  - Placeholder / parked page detection
  *  - Cloudflare / WAF / 5xx error detection
- *  - Blank or JS-only page detection (including redirect scripts)
+ *  - Blank or JS-only page detection (including JS redirects)
  *  - Clear summary with status icons
  */
 
@@ -128,13 +128,13 @@ async function fetchUrl(url, timeoutMs = REQUEST_TIMEOUT_MS) {
 function isEmptyOrJsOnly(body) {
   if (!body) return "EMPTY_PAGE";
 
-  // Remove <head>, <noscript> and whitespace
+  // Remove <head>, <noscript>, whitespace
   const stripped = body
     .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, "")
     .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "")
     .replace(/\s/g, "");
 
-  // Extract script content
+  // Extract all script content
   const scriptMatches = [...body.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)];
   const scriptContent = scriptMatches.map((m) => m[1]).join("").trim();
 
@@ -148,6 +148,15 @@ function isEmptyOrJsOnly(body) {
 
 /**
  * Check if a domain is accessible and determine status
+ *
+ * Validation order:
+ * 1. Low-level network errors (timeout, SSL, refused)
+ * 2. Redirects (up to MAX_REDIRECTS)
+ * 3. HTTP status code checks (4xx/5xx)
+ * 4. Cloudflare/WAF/5xx page detection
+ * 5. Placeholder / parked page detection
+ * 6. Blank page or JS-only detection
+ * 7. Otherwise → VALID
  */
 async function checkDomainStatus(domain) {
   const protocols = ["https", "http"];
@@ -164,36 +173,42 @@ async function checkDomainStatus(domain) {
 
         const { status, statusCode, headers, body } = await fetchUrl(url);
 
-        // Low-level connection / SSL / timeout errors
+        // 1️⃣ Low-level network errors
         if (status) return status;
 
-        // Handle redirects
+        // 2️⃣ Redirects
         if (statusCode >= 300 && statusCode < 400 && headers.location) {
           url = new URL(headers.location, url).toString();
           redirects++;
           continue;
         }
 
-        // HTTP errors
-        if (statusCode >= 500) return "SERVER_ERROR";
-        if (statusCode >= 400) return "CLIENT_ERROR";
+        // 3️⃣ HTTP errors
+        if (statusCode >= 500 && statusCode <= 525) return "SERVER_ERROR";
+        if (statusCode >= 400 && statusCode < 500) return "CLIENT_ERROR";
 
         if (body) {
-          // Cloudflare / WAF / known error pages (even without cf-wrapper ID)
-          if (ERROR_PAGE_PATTERNS.some((p) => body.includes(p))) return "SERVER_ERROR";
+          const bodyLower = body.toLowerCase();
 
-          if (body.includes("Cloudflare Ray ID") || WAF_PATTERNS.some((p) => body.includes(p)))
+          // 4️⃣ Cloudflare / WAF detection
+          if (
+            body.includes("cloudflare") &&
+            ERROR_PAGE_PATTERNS.some((p) => body.includes(p))
+          )
+            return "SERVER_ERROR";
+
+          if (body.includes("cloudflare") || WAF_PATTERNS.some((p) => body.includes(p)))
             return "PROTECTED";
 
-          // Check for blank / JS-only page
+          // 5️⃣ Placeholder / parked page detection
+          if (PLACEHOLDER_PATTERNS.some((p) => body.includes(p))) return "PLACEHOLDER";
+
+          // 6️⃣ Blank page or JS-only detection
           const emptyCheck = isEmptyOrJsOnly(body);
           if (emptyCheck) return emptyCheck;
-
-          // Placeholder pages
-          if (PLACEHOLDER_PATTERNS.some((p) => body.includes(p))) return "PLACEHOLDER";
         }
 
-        // If none of the above, page is valid
+        // 7️⃣ All checks passed → VALID
         return "VALID";
       }
 
